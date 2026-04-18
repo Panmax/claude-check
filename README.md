@@ -33,16 +33,20 @@ irm https://raw.githubusercontent.com/Panmax/claude-check/main/claude_check.py |
 
 ## 🔍 它能检测什么？
 
-| 检测项 | 说明 | 风险等级 |
-|--------|------|----------|
-| 🔌 **代理环境变量** | 检查 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` 是否配置 | 提示 |
-| 🌐 **IPv6 泄漏** | 多目标探测 IPv6 出口连通性，防止真实 IP 绕过代理裸奔 | 🔴 高危 |
-| 🧭 **DNS 泄漏** | 检测 DNS 出口是否泄漏到国内节点 | 🔴 高危 |
-| 🕒 **时区匹配** | 对比本机系统时区与代理出口 IP 所在时区，暴露翻墙特征 | 🔴 高危 |
-| 📊 **IP 质量** | 判定出口 IP 是家宽/原生 ISP 还是商用机房/代理节点 | 🟡 中危 |
-| 🛡️ **Cloudflare WAF** | 探测 claude.ai 是否对当前 IP 发起人机验证拦截 | 🔴 高危 |
-| 🔗 **API 连通性** | 逆向探测 Anthropic API 是否对当前 IP 硬封锁 | 🔴 高危 |
-| 📋 **综合评估** | 汇总所有检测项，给出风险等级 + 修复建议 | - |
+| # | 检测项 | 说明 | 风险等级 |
+|---|--------|------|----------|
+| 1 | 🔌 **代理环境变量** | 检查 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` 是否配置 | 提示 |
+| 2 | 🌐 **IPv6 泄漏** | 多目标探测 IPv6 出口连通性，防止真实 IP 绕过代理裸奔 | 🔴 高危 |
+| 3 | 🧭 **DNS 泄漏** | 检测 DNS 出口是否泄漏到国内节点 | 🔴 高危 |
+| 4 | 🕒 **时区匹配** | 对比本机系统时区与代理出口 IP 所在时区 | 🔴 高危 |
+| 5 | 🌍 **语言匹配** | 对比系统语言与出口 IP 所在国家常用语言 | 🟡 中危 |
+| 6 | 📊 **IP 质量** | 判定出口 IP 是家宽/原生 ISP 还是商用机房/代理节点 | 🟡 中危 |
+| 7 | 🎯 **Cloudflare Trace** | 通过 claude.ai CDN trace 获取 Claude 实际看到的 IP，对比检测分流泄漏 | 🟡 中危 |
+| 8 | 🛡️ **Cloudflare WAF** | 探测 claude.ai 是否对当前 IP 发起人机验证或拦截 | 🔴 高危 |
+| 9 | 🔗 **API 连通性** | 逆向探测 Anthropic API 是否对当前 IP 硬封锁 | 🔴 高危 |
+| 10 | ⏱️ **延迟测试** | 测量到 claude.ai 和 api.anthropic.com 的响应延迟 | 参考 |
+| 11 | 📡 **服务状态** | 集成 Anthropic 官方 Status 页面，区分「你的问题」还是「官方的问题」 | 参考 |
+| 12 | 🔒 **信任评分** | 0-100 量化评分 + 进度条可视化 + 综合风险等级 | 总评 |
 
 ## 📸 输出示例
 
@@ -57,31 +61,54 @@ irm https://raw.githubusercontent.com/Panmax/claude-check/main/claude_check.py |
   ✅ IPv6 处于关闭或不可达状态 (安全，无绕过代理泄漏风险)
   ✅ DNS 无国内泄漏。海外出口 DNS 为: 1.1.1.1 (United States)
   🕒 本机系统时区: PST (UTC-8.0)
+  🌍 本机系统语言: en
 
-[*] 2. 落地 IP 质量与时区匹配度 (IP Quality & Timezone Match)
+[*] 2. 落地 IP 质量与环境匹配度 (IP Quality & Fingerprint Match)
   📍 物理位置: United States (US) - Los Angeles
   🌐 出口 IP : 203.x.x.x
   🏢 归属 ASN: AS12345 Example ISP
   📡 运营商  : Example ISP
   ✅ IP 质量优秀: 检测为 [真实家庭宽带/原生ISP] -> 适合防封
-  ✅ 伪装完美：本机时区与代理出口 IP 时区完全一致: America/Los_Angeles (UTC-8.0)
+  ✅ 时区匹配：本机时区与代理出口 IP 时区完全一致: America/Los_Angeles (UTC-8.0)
+  ✅ 语言匹配：系统语言 (en) 与出口地区 (US) 一致
 
-[*] 3. 探测 Claude 前端 Web 盾防御策略 (Cloudflare WAF Check)
+[*] 3. Cloudflare Trace 真实出口 IP (Claude 视角)
+  🎯 Claude 看到的 IP: 203.x.x.x
+  📍 Cloudflare 边缘 : LAX (US)
+  ✅ IP 一致：ip-api (203.x.x.x) = Cloudflare (203.x.x.x)，无分流泄漏
+
+[*] 4. 探测 Claude 前端 Web 盾防御策略 (Cloudflare WAF Check)
   ✅ 网页直连通过: 无 Cloudflare 人机拦截，Web 盾前置放行！
 
-[*] 4. 逆向探测 Anthropic API 底层连通性 (API Hard-Ban Check)
+[*] 5. 逆向探测 Anthropic API 底层连通性 (API Hard-Ban Check)
   ✅ API 穿透成功: 流量直达 Anthropic 核心后端，IP 未在硬封锁黑名单中！
 
-====================== 综合风险评估 ================================
+[*] 6. 连接延迟与 Anthropic 服务状态 (Latency & Status)
+  ⏱️  claude.ai                  : 156ms (快)
+  ⏱️  api.anthropic.com          : 203ms (快)
+  📡 Anthropic 服务状态  : ✅ All Systems Operational
+
+====================================================================
+                        综合风险评估
+====================================================================
+
+  信任评分  100/100  极度纯净
+  ████████████████████
+
+  检测项        结果
+  ────────────────────────────────────────
   IPv6 泄漏    : ✅ 安全
   DNS 泄漏     : ✅ 安全
   时区匹配     : ✅ 安全
+  语言匹配     : ✅ 安全
   IP 质量      : ✅ 安全
+  IP 一致性    : ✅ 安全
   Web WAF      : ✅ 安全
   API 连通     : ✅ 安全
 
   🔒 综合风险等级: 低风险 (LOW)
-=====================================================================
+
+====================================================================
 ```
 
 ## ⚙️ 命令行参数

@@ -3,7 +3,6 @@
 
 """claude_check.py 单元测试"""
 
-import io
 import json
 import socket
 import unittest
@@ -14,9 +13,9 @@ import claude_check
 
 class TestColors(unittest.TestCase):
     def setUp(self):
-        # 保存原始值
         self._orig = {attr: getattr(claude_check.Colors, attr)
-                      for attr in ('GREEN', 'RED', 'YELLOW', 'BLUE', 'BOLD', 'RESET')}
+                      for attr in ('GREEN', 'RED', 'YELLOW', 'BLUE', 'CYAN',
+                                   'MAGENTA', 'DIM', 'BOLD', 'RESET')}
 
     def tearDown(self):
         for attr, val in self._orig.items():
@@ -24,7 +23,7 @@ class TestColors(unittest.TestCase):
 
     def test_disable_clears_all(self):
         claude_check.Colors.disable()
-        for attr in ('GREEN', 'RED', 'YELLOW', 'BLUE', 'BOLD', 'RESET'):
+        for attr in self._orig:
             self.assertEqual(getattr(claude_check.Colors, attr), '')
 
 
@@ -58,6 +57,110 @@ class TestCheckIPv6(unittest.TestCase):
         mock_sock.close.assert_called_once()
 
 
+class TestTrustScore(unittest.TestCase):
+    def _base_results(self):
+        return {
+            'ipv6': {'connected': False},
+            'dns_leak': {'status': 'safe'},
+            'ip_quality': {
+                'status': 'ok',
+                'hosting': False,
+                'proxy': False,
+                'timezone_match': True,
+                'lang_match': True,
+            },
+            'cf_trace': {'status': 'ok', 'ip_consistent': True},
+            'cloudflare_waf': {'status': 'pass'},
+            'api_connectivity': {'status': 'reachable'},
+        }
+
+    def test_perfect_score(self):
+        score, details = claude_check.calculate_trust_score(self._base_results())
+        self.assertEqual(score, 100)
+        for v in details.values():
+            self.assertEqual(v, 0)
+
+    def test_ipv6_leak_deducts_20(self):
+        r = self._base_results()
+        r['ipv6']['connected'] = True
+        score, details = claude_check.calculate_trust_score(r)
+        self.assertEqual(score, 80)
+        self.assertEqual(details['ipv6'], -20)
+
+    def test_dns_leak_deducts_20(self):
+        r = self._base_results()
+        r['dns_leak']['status'] = 'leaked'
+        score, _ = claude_check.calculate_trust_score(r)
+        self.assertEqual(score, 80)
+
+    def test_hosting_ip_deducts_15(self):
+        r = self._base_results()
+        r['ip_quality']['hosting'] = True
+        score, details = claude_check.calculate_trust_score(r)
+        self.assertEqual(score, 85)
+        self.assertEqual(details['ip_type'], -15)
+
+    def test_timezone_mismatch_deducts_15(self):
+        r = self._base_results()
+        r['ip_quality']['timezone_match'] = False
+        score, _ = claude_check.calculate_trust_score(r)
+        self.assertEqual(score, 85)
+
+    def test_lang_mismatch_deducts_5(self):
+        r = self._base_results()
+        r['ip_quality']['lang_match'] = False
+        score, _ = claude_check.calculate_trust_score(r)
+        self.assertEqual(score, 95)
+
+    def test_ip_inconsistency_deducts_10(self):
+        r = self._base_results()
+        r['cf_trace']['ip_consistent'] = False
+        score, _ = claude_check.calculate_trust_score(r)
+        self.assertEqual(score, 90)
+
+    def test_waf_blocked_deducts_15(self):
+        r = self._base_results()
+        r['cloudflare_waf']['status'] = 'blocked'
+        score, _ = claude_check.calculate_trust_score(r)
+        self.assertEqual(score, 85)
+
+    def test_api_banned_deducts_15(self):
+        r = self._base_results()
+        r['api_connectivity']['status'] = 'hard_banned'
+        score, _ = claude_check.calculate_trust_score(r)
+        self.assertEqual(score, 85)
+
+    def test_everything_bad(self):
+        r = {
+            'ipv6': {'connected': True},                          # -20
+            'dns_leak': {'status': 'leaked'},                     # -20
+            'ip_quality': {
+                'status': 'ok',
+                'hosting': True,                                  # -15
+                'proxy': True,
+                'timezone_match': False,                          # -15
+                'lang_match': False,                              # -5
+            },
+            'cf_trace': {'status': 'ok', 'ip_consistent': False}, # -10
+            'cloudflare_waf': {'status': 'blocked'},              # -15
+            'api_connectivity': {'status': 'hard_banned'},        # -15
+        }
+        score, _ = claude_check.calculate_trust_score(r)
+        # -20-20-15-15-5-10-15-15 = -115, clamped to 0
+        self.assertEqual(score, 0)
+
+    def test_score_never_negative(self):
+        r = self._base_results()
+        r['ipv6']['connected'] = True
+        r['dns_leak']['status'] = 'leaked'
+        r['ip_quality']['hosting'] = True
+        r['ip_quality']['timezone_match'] = False
+        r['cloudflare_waf']['status'] = 'blocked'
+        r['api_connectivity']['status'] = 'hard_banned'
+        score, _ = claude_check.calculate_trust_score(r)
+        self.assertGreaterEqual(score, 0)
+
+
 class TestCalculateRisk(unittest.TestCase):
     def _base_results(self):
         return {
@@ -68,7 +171,9 @@ class TestCalculateRisk(unittest.TestCase):
                 'hosting': False,
                 'proxy': False,
                 'timezone_match': True,
+                'lang_match': True,
             },
+            'cf_trace': {'status': 'ok', 'ip_consistent': True},
             'cloudflare_waf': {'status': 'pass'},
             'api_connectivity': {'status': 'reachable'},
         }
@@ -87,6 +192,18 @@ class TestCalculateRisk(unittest.TestCase):
     def test_hosting_ip_is_medium(self):
         r = self._base_results()
         r['ip_quality']['hosting'] = True
+        level, _ = claude_check.calculate_risk(r)
+        self.assertEqual(level, 'MEDIUM')
+
+    def test_lang_mismatch_is_medium(self):
+        r = self._base_results()
+        r['ip_quality']['lang_match'] = False
+        level, _ = claude_check.calculate_risk(r)
+        self.assertEqual(level, 'MEDIUM')
+
+    def test_ip_inconsistency_is_medium(self):
+        r = self._base_results()
+        r['cf_trace']['ip_consistent'] = False
         level, _ = claude_check.calculate_risk(r)
         self.assertEqual(level, 'MEDIUM')
 
@@ -117,6 +234,20 @@ class TestCalculateRisk(unittest.TestCase):
         self.assertEqual(level, 'HIGH')
 
 
+class TestScoreLabel(unittest.TestCase):
+    def test_labels(self):
+        _, label = claude_check._score_label(95)
+        self.assertEqual(label, '极度纯净')
+        _, label = claude_check._score_label(80)
+        self.assertEqual(label, '纯净')
+        _, label = claude_check._score_label(60)
+        self.assertEqual(label, '良好')
+        _, label = claude_check._score_label(30)
+        self.assertEqual(label, '中性')
+        _, label = claude_check._score_label(10)
+        self.assertEqual(label, '危险')
+
+
 class TestFmtOffset(unittest.TestCase):
     def test_positive(self):
         self.assertEqual(claude_check._fmt_offset(28800), 'UTC+8.0')
@@ -126,6 +257,20 @@ class TestFmtOffset(unittest.TestCase):
 
     def test_zero(self):
         self.assertEqual(claude_check._fmt_offset(0), 'UTC+0.0')
+
+
+class TestGetSystemLang(unittest.TestCase):
+    @mock.patch.dict('os.environ', {'LANG': 'en_US.UTF-8'})
+    def test_from_lang_env(self):
+        self.assertEqual(claude_check._get_system_lang(), 'en')
+
+    @mock.patch.dict('os.environ', {'LANG': 'zh_CN.UTF-8'})
+    def test_chinese(self):
+        self.assertEqual(claude_check._get_system_lang(), 'zh')
+
+    @mock.patch.dict('os.environ', {'LANG': '', 'LANGUAGE': 'ja_JP'})
+    def test_from_language_env(self):
+        self.assertEqual(claude_check._get_system_lang(), 'ja')
 
 
 class TestParseArgs(unittest.TestCase):

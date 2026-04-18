@@ -3,15 +3,17 @@
 
 """
 Claude AI - 终极环境安全深度检测工具 (Pro 版)
-融合本地网络防漏检测 (IPv6/DNS/时区) + 目标服务器 WAF 穿透探测
+融合本地网络防漏检测 (IPv6/DNS/时区/语言) + 目标服务器 WAF 穿透探测
 零依赖，原生支持 macOS / Linux / Windows
 """
 
 import argparse
 import datetime
 import json
+import locale
 import os
 import platform
+import re
 import socket
 import sys
 import time
@@ -33,6 +35,20 @@ CF_CHALLENGE_MARKERS = [
     'managed_checking',
 ]
 
+# 国家代码 → 常见系统语言前缀映射（用于语言匹配检测）
+COUNTRY_LANG_MAP = {
+    'US': ['en'], 'GB': ['en'], 'AU': ['en'], 'CA': ['en', 'fr'],
+    'JP': ['ja'], 'KR': ['ko'], 'DE': ['de'], 'FR': ['fr'],
+    'TW': ['zh'], 'HK': ['zh', 'en'], 'SG': ['en', 'zh'],
+    'BR': ['pt'], 'RU': ['ru'], 'IN': ['en', 'hi'],
+    'NL': ['nl', 'en'], 'SE': ['sv', 'en'], 'NO': ['no', 'nb', 'nn', 'en'],
+    'DK': ['da', 'en'], 'FI': ['fi', 'en'], 'IT': ['it'],
+    'ES': ['es'], 'MX': ['es'], 'AR': ['es'],
+    'TH': ['th'], 'VN': ['vi'], 'PH': ['en', 'fil'],
+    'MY': ['ms', 'en'], 'ID': ['id'],
+    'TR': ['tr'], 'PL': ['pl'], 'CZ': ['cs'],
+}
+
 # ─── 颜色 ───────────────────────────────────────────────────────────────
 
 class Colors:
@@ -40,12 +56,17 @@ class Colors:
     RED = '\033[91m'
     YELLOW = '\033[93m'
     BLUE = '\033[94m'
+    CYAN = '\033[96m'
+    MAGENTA = '\033[95m'
+    DIM = '\033[2m'
     BOLD = '\033[1m'
     RESET = '\033[0m'
 
     @classmethod
     def disable(cls):
-        cls.GREEN = cls.RED = cls.YELLOW = cls.BLUE = cls.BOLD = cls.RESET = ''
+        for attr in ('GREEN', 'RED', 'YELLOW', 'BLUE', 'CYAN', 'MAGENTA',
+                      'DIM', 'BOLD', 'RESET'):
+            setattr(cls, attr, '')
 
 
 def _init_colors(force_no_color=False):
@@ -71,9 +92,53 @@ def _urlopen_read(req, timeout=10):
         return data.decode(charset), resp.headers
 
 
+def _timed_request(url, timeout=10, headers=None):
+    """发起请求并返回 (elapsed_ms, status_code)。仅测量延迟，不读取完整响应体。"""
+    hdrs = {'User-Agent': CHROME_UA}
+    if headers:
+        hdrs.update(headers)
+    req = urllib.request.Request(url, headers=hdrs)
+    start = time.monotonic()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            _ = resp.read(1)  # 触发实际连接
+            elapsed = (time.monotonic() - start) * 1000
+            return elapsed, resp.status
+    except urllib.error.HTTPError as e:
+        elapsed = (time.monotonic() - start) * 1000
+        return elapsed, e.code
+    except Exception:
+        return None, None
+
+
 def _fmt_offset(seconds):
     """将秒数格式化为 UTC±X.X 字符串。"""
     return f"UTC{seconds / 3600:+.1f}"
+
+
+def _fmt_latency(ms):
+    """格式化延迟值并附加颜色。"""
+    if ms is None:
+        return f"{Colors.RED}超时{Colors.RESET}"
+    if ms < 250:
+        return f"{Colors.GREEN}{ms:.0f}ms (快){Colors.RESET}"
+    elif ms < 500:
+        return f"{Colors.YELLOW}{ms:.0f}ms (一般){Colors.RESET}"
+    else:
+        return f"{Colors.RED}{ms:.0f}ms (慢){Colors.RESET}"
+
+
+def _get_system_lang():
+    """获取系统语言前缀，如 'en'、'zh'。"""
+    lang = os.environ.get('LANG') or os.environ.get('LANGUAGE') or ''
+    if not lang:
+        try:
+            lang = locale.getdefaultlocale()[0] or ''
+        except Exception:
+            lang = ''
+    # 提取语言前缀: zh_CN.UTF-8 -> zh, en_US -> en
+    m = re.match(r'^([a-z]{2})', lang.lower())
+    return m.group(1) if m else None
 
 # ─── 检测模块 ────────────────────────────────────────────────────────────
 
@@ -138,6 +203,12 @@ def check_local_env(results):
     results['timezone'] = {'local_offset': local_offset_sec, 'local_tz': local_tz_name}
     print(f"  🕒 本机系统时区: {local_tz_name} ({_fmt_offset(local_offset_sec)})")
 
+    # ── 本地语言 ──
+    sys_lang = _get_system_lang()
+    results['system_lang'] = sys_lang
+    if sys_lang:
+        print(f"  🌍 本机系统语言: {sys_lang}")
+
 
 def _check_ipv6():
     """检测 IPv6 外部连通性。返回 (connected: bool, addr: str|None)。"""
@@ -167,8 +238,8 @@ def _check_ipv6():
 
 
 def check_ip_attributes(results):
-    """2. 落地 IP 质量与时区匹配度"""
-    print(f"\n{Colors.BOLD}[*] 2. 落地 IP 质量与时区匹配度 (IP Quality & Timezone Match){Colors.RESET}")
+    """2. 落地 IP 质量与时区/语言匹配度"""
+    print(f"\n{Colors.BOLD}[*] 2. 落地 IP 质量与环境匹配度 (IP Quality & Fingerprint Match){Colors.RESET}")
 
     url = ("http://ip-api.com/json/"
            "?fields=status,country,countryCode,city,isp,org,as,mobile,proxy,hosting,query,timezone,offset")
@@ -206,7 +277,12 @@ def check_ip_attributes(results):
         is_hosting = data.get('hosting', False)
         is_proxy = data.get('proxy', False)
         if is_hosting or is_proxy:
-            print(f"  {Colors.RED}⚠️  IP 质量风险: 检测为 [商用机房 Hosting / 代理节点]{Colors.RESET}"
+            labels = []
+            if is_hosting:
+                labels.append('商用机房 Hosting')
+            if is_proxy:
+                labels.append('代理节点')
+            print(f"  {Colors.RED}⚠️  IP 质量风险: 检测为 [{' / '.join(labels)}]{Colors.RESET}"
                   f" -> 极易引发连坐封号")
         else:
             print(f"  {Colors.GREEN}✅ IP 质量优秀: 检测为 [真实家庭宽带/原生ISP]{Colors.RESET}"
@@ -221,7 +297,7 @@ def check_ip_attributes(results):
         if proxy_offset_sec is not None and local_offset_sec is not None:
             tz_match = (local_offset_sec == proxy_offset_sec)
             if tz_match:
-                print(f"  {Colors.GREEN}✅ 伪装完美：本机时区与代理出口 IP 时区完全一致: "
+                print(f"  {Colors.GREEN}✅ 时区匹配：本机时区与代理出口 IP 时区完全一致: "
                       f"{proxy_tz} ({_fmt_offset(proxy_offset_sec)}){Colors.RESET}")
             else:
                 print(f"  {Colors.RED}❌ 时区不匹配！本机({_fmt_offset(local_offset_sec)}) "
@@ -231,6 +307,25 @@ def check_ip_attributes(results):
 
         ip_result['timezone_match'] = tz_match
         ip_result['proxy_tz'] = proxy_tz
+
+        # 语言一致性校验
+        country_code = data.get('countryCode', '')
+        sys_lang = results.get('system_lang')
+        lang_match = None
+
+        if sys_lang and country_code in COUNTRY_LANG_MAP:
+            expected_langs = COUNTRY_LANG_MAP[country_code]
+            lang_match = sys_lang in expected_langs
+            ip_result['lang_match'] = lang_match
+            if lang_match:
+                print(f"  {Colors.GREEN}✅ 语言匹配：系统语言 ({sys_lang}) 与出口地区 ({country_code}) 一致{Colors.RESET}")
+            else:
+                print(f"  {Colors.YELLOW}⚠️ 语言不匹配：系统语言 ({sys_lang}) 与出口地区 ({country_code}) "
+                      f"常用语言 ({'/'.join(expected_langs)}) 不一致{Colors.RESET}")
+                print(f"     -> 风控参考：语言环境不一致是常见的代理用户特征，"
+                      f"建议修改系统语言或使用浏览器语言覆盖。")
+        else:
+            ip_result['lang_match'] = None
 
     except urllib.error.HTTPError as e:
         if e.code == 429:
@@ -246,9 +341,66 @@ def check_ip_attributes(results):
     results['ip_quality'] = ip_result
 
 
+def check_cloudflare_trace(results):
+    """3. Cloudflare Trace 真实出口 IP 对比"""
+    print(f"\n{Colors.BOLD}[*] 3. Cloudflare Trace 真实出口 IP (Claude 视角){Colors.RESET}")
+
+    trace_result = {'status': 'unknown'}
+
+    try:
+        req = urllib.request.Request("https://claude.ai/cdn-cgi/trace",
+                                     headers={'User-Agent': CHROME_UA})
+        text, _ = _urlopen_read(req, timeout=10)
+
+        # 解析 Cloudflare trace 键值对格式: key=value
+        trace_data = {}
+        for line in text.strip().splitlines():
+            if '=' in line:
+                k, v = line.split('=', 1)
+                trace_data[k.strip()] = v.strip()
+
+        cf_ip = trace_data.get('ip', '')
+        cf_loc = trace_data.get('loc', '')
+        cf_colo = trace_data.get('colo', '')  # 边缘节点代码，如 LAX, NRT
+
+        trace_result.update({
+            'status': 'ok',
+            'ip': cf_ip,
+            'loc': cf_loc,
+            'colo': cf_colo,
+        })
+
+        print(f"  🎯 Claude 看到的 IP: {cf_ip}")
+        print(f"  📍 Cloudflare 边缘 : {cf_colo} ({cf_loc})")
+
+        # 对比 ip-api 获取的 IP
+        ipapi_ip = results.get('ip_quality', {}).get('ip', '')
+        if ipapi_ip and cf_ip:
+            if ipapi_ip == cf_ip:
+                trace_result['ip_consistent'] = True
+                print(f"  {Colors.GREEN}✅ IP 一致：ip-api ({ipapi_ip}) = Cloudflare ({cf_ip})，"
+                      f"无分流泄漏{Colors.RESET}")
+            else:
+                trace_result['ip_consistent'] = False
+                print(f"  {Colors.YELLOW}⚠️ IP 不一致：ip-api ({ipapi_ip}) ≠ Cloudflare ({cf_ip}){Colors.RESET}")
+                print(f"     -> 可能存在分流/隧道配置差异，部分流量未经代理。"
+                      f"请检查代理规则是否覆盖 claude.ai 域名。")
+        else:
+            trace_result['ip_consistent'] = None
+
+    except urllib.error.HTTPError as e:
+        trace_result['status'] = f'http_{e.code}'
+        print(f"  {Colors.YELLOW}⚠️ Cloudflare Trace 异常 (HTTP {e.code}){Colors.RESET}")
+    except (urllib.error.URLError, socket.timeout) as e:
+        trace_result['status'] = 'error'
+        print(f"  {Colors.RED}❌ Cloudflare Trace 请求失败: {e}{Colors.RESET}")
+
+    results['cf_trace'] = trace_result
+
+
 def check_claude_web(results):
-    """3. 探测 Claude 前端 Web 盾防御策略"""
-    print(f"\n{Colors.BOLD}[*] 3. 探测 Claude 前端 Web 盾防御策略 (Cloudflare WAF Check){Colors.RESET}")
+    """4. 探测 Claude 前端 Web 盾防御策略"""
+    print(f"\n{Colors.BOLD}[*] 4. 探测 Claude 前端 Web 盾防御策略 (Cloudflare WAF Check){Colors.RESET}")
 
     url = "https://claude.ai/login"
     req = urllib.request.Request(url, headers={'User-Agent': CHROME_UA})
@@ -288,8 +440,8 @@ def check_claude_web(results):
 
 
 def check_claude_api(results):
-    """4. 逆向探测 Anthropic API 底层连通性"""
-    print(f"\n{Colors.BOLD}[*] 4. 逆向探测 Anthropic API 底层连通性 (API Hard-Ban Check){Colors.RESET}")
+    """5. 逆向探测 Anthropic API 底层连通性"""
+    print(f"\n{Colors.BOLD}[*] 5. 逆向探测 Anthropic API 底层连通性 (API Hard-Ban Check){Colors.RESET}")
 
     url = "https://api.anthropic.com/v1/messages"
     req = urllib.request.Request(url, data=b'{}', headers={
@@ -324,6 +476,169 @@ def check_claude_api(results):
 
     results['api_connectivity'] = api_result
 
+
+def check_latency_and_status(results):
+    """6. 延迟测试与服务状态"""
+    print(f"\n{Colors.BOLD}[*] 6. 连接延迟与 Anthropic 服务状态 (Latency & Status){Colors.RESET}")
+
+    latency_result = {}
+
+    # ── 延迟测试 ──
+    targets = [
+        ("claude.ai", "https://claude.ai/cdn-cgi/trace"),
+        ("api.anthropic.com", "https://api.anthropic.com"),
+    ]
+    for name, url in targets:
+        ms, code = _timed_request(url, timeout=10)
+        latency_result[name] = {'latency_ms': round(ms, 1) if ms else None, 'status_code': code}
+        print(f"  ⏱️  {name:25s} : {_fmt_latency(ms)}"
+              + (f" {Colors.DIM}(HTTP {code}){Colors.RESET}" if code else ""))
+
+    # ── Anthropic 官方服务状态 ──
+    status_result = {'status': 'unknown'}
+    try:
+        req = urllib.request.Request("https://status.anthropic.com/api/v2/status.json",
+                                     headers={'User-Agent': CHROME_UA})
+        text, _ = _urlopen_read(req, timeout=8)
+        status_data = json.loads(text)
+        indicator = status_data.get('status', {}).get('indicator', '')
+        description = status_data.get('status', {}).get('description', '')
+        status_result = {'status': indicator, 'description': description}
+
+        indicator_map = {
+            'none': (Colors.GREEN, '✅', '所有系统正常'),
+            'minor': (Colors.YELLOW, '⚠️', '部分系统异常'),
+            'major': (Colors.RED, '❌', '主要系统故障'),
+            'critical': (Colors.RED, '🚨', '严重故障'),
+        }
+        color, icon, label = indicator_map.get(indicator, (Colors.YELLOW, '❓', indicator))
+        print(f"  📡 Anthropic 服务状态  : {color}{icon} {description or label}{Colors.RESET}")
+
+    except Exception:
+        print(f"  {Colors.YELLOW}⚠️ 无法获取 Anthropic 服务状态{Colors.RESET}")
+
+    results['latency'] = latency_result
+    results['service_status'] = status_result
+
+# ─── 信任评分 ────────────────────────────────────────────────────────────
+
+def calculate_trust_score(results):
+    """
+    计算 0-100 的信任评分。
+    满分 100，各项扣分。分数越高越安全。
+    """
+    score = 100
+    details = {}
+
+    # IPv6 泄漏 (-20)
+    if results.get('ipv6', {}).get('connected'):
+        score -= 20
+        details['ipv6'] = -20
+    else:
+        details['ipv6'] = 0
+
+    # DNS 泄漏 (-20)
+    dns_status = results.get('dns_leak', {}).get('status')
+    if dns_status == 'leaked':
+        score -= 20
+        details['dns'] = -20
+    elif dns_status == 'unknown':
+        score -= 5
+        details['dns'] = -5
+    else:
+        details['dns'] = 0
+
+    # 时区匹配 (-15)
+    tz_match = results.get('ip_quality', {}).get('timezone_match')
+    if tz_match is False:
+        score -= 15
+        details['timezone'] = -15
+    elif tz_match is None:
+        score -= 3
+        details['timezone'] = -3
+    else:
+        details['timezone'] = 0
+
+    # 语言匹配 (-5)
+    lang_match = results.get('ip_quality', {}).get('lang_match')
+    if lang_match is False:
+        score -= 5
+        details['language'] = -5
+    else:
+        details['language'] = 0
+
+    # IP 质量 (-15: hosting, -10: proxy only)
+    ip_q = results.get('ip_quality', {})
+    if ip_q.get('hosting'):
+        score -= 15
+        details['ip_type'] = -15
+    elif ip_q.get('proxy'):
+        score -= 10
+        details['ip_type'] = -10
+    else:
+        details['ip_type'] = 0
+
+    # IP 一致性 (-10)
+    cf_consistent = results.get('cf_trace', {}).get('ip_consistent')
+    if cf_consistent is False:
+        score -= 10
+        details['ip_consistency'] = -10
+    else:
+        details['ip_consistency'] = 0
+
+    # WAF (-15)
+    waf_status = results.get('cloudflare_waf', {}).get('status')
+    if waf_status == 'blocked':
+        score -= 15
+        details['waf'] = -15
+    elif waf_status == 'js_challenge':
+        score -= 8
+        details['waf'] = -8
+    elif waf_status not in ('pass', 'skipped'):
+        score -= 3
+        details['waf'] = -3
+    else:
+        details['waf'] = 0
+
+    # API (-15)
+    api_status = results.get('api_connectivity', {}).get('status')
+    if api_status == 'hard_banned':
+        score -= 15
+        details['api'] = -15
+    elif api_status == 'error':
+        score -= 5
+        details['api'] = -5
+    elif api_status not in ('reachable', 'skipped'):
+        score -= 3
+        details['api'] = -3
+    else:
+        details['api'] = 0
+
+    score = max(0, score)
+    return score, details
+
+
+def _score_label(score):
+    """返回 (颜色, 标签)。"""
+    if score >= 90:
+        return Colors.GREEN, '极度纯净'
+    elif score >= 75:
+        return Colors.GREEN, '纯净'
+    elif score >= 50:
+        return Colors.YELLOW, '良好'
+    elif score >= 25:
+        return Colors.YELLOW, '中性'
+    else:
+        return Colors.RED, '危险'
+
+
+def _score_bar(score):
+    """生成分数进度条。"""
+    filled = score // 5  # 0-20 格
+    empty = 20 - filled
+    color, _ = _score_label(score)
+    return f"{color}{'█' * filled}{Colors.DIM}{'░' * empty}{Colors.RESET}"
+
 # ─── 综合评估 ────────────────────────────────────────────────────────────
 
 def calculate_risk(results):
@@ -332,12 +647,10 @@ def calculate_risk(results):
     yellow_flags = 0
     suggestions = []
 
-    # IPv6
     if results.get('ipv6', {}).get('connected'):
         red_flags += 1
         suggestions.append('在网络设置中禁用 IPv6')
 
-    # DNS
     dns_status = results.get('dns_leak', {}).get('status')
     if dns_status == 'leaked':
         red_flags += 1
@@ -345,19 +658,26 @@ def calculate_risk(results):
     elif dns_status == 'unknown':
         yellow_flags += 1
 
-    # 时区
     tz_match = results.get('ip_quality', {}).get('timezone_match')
     if tz_match is False:
         red_flags += 1
         suggestions.append('修改系统时区为代理节点所在时区')
 
-    # IP 质量
+    lang_match = results.get('ip_quality', {}).get('lang_match')
+    if lang_match is False:
+        yellow_flags += 1
+        suggestions.append('修改系统语言为代理节点所在地区常用语言')
+
     ip_q = results.get('ip_quality', {})
     if ip_q.get('hosting') or ip_q.get('proxy'):
         yellow_flags += 1
         suggestions.append('考虑更换为住宅 IP / 原生 ISP 节点')
 
-    # WAF
+    cf_consistent = results.get('cf_trace', {}).get('ip_consistent')
+    if cf_consistent is False:
+        yellow_flags += 1
+        suggestions.append('检查代理分流规则，确保 claude.ai 流量经过代理')
+
     waf_status = results.get('cloudflare_waf', {}).get('status')
     if waf_status == 'blocked':
         red_flags += 1
@@ -366,7 +686,6 @@ def calculate_risk(results):
         yellow_flags += 1
         suggestions.append('当前 IP 需通过 JS Challenge，建议更换更干净的节点')
 
-    # API
     api_status = results.get('api_connectivity', {}).get('status')
     if api_status == 'hard_banned':
         red_flags += 1
@@ -374,7 +693,6 @@ def calculate_risk(results):
     elif api_status == 'error':
         yellow_flags += 1
 
-    # 综合判定
     if red_flags >= 2:
         level = 'CRITICAL'
     elif red_flags >= 1:
@@ -390,8 +708,11 @@ def calculate_risk(results):
 def print_summary(results):
     """打印综合风险评估报告。"""
     level, suggestions = calculate_risk(results)
+    score, score_details = calculate_trust_score(results)
     results['overall_risk'] = level
     results['suggestions'] = suggestions
+    results['trust_score'] = score
+    results['trust_score_details'] = score_details
 
     level_colors = {
         'LOW': Colors.GREEN,
@@ -417,27 +738,48 @@ def print_summary(results):
     dns_ok = results.get('dns_leak', {}).get('status') == 'safe'
     dns_unknown = results.get('dns_leak', {}).get('status') == 'unknown'
     tz_ok = results.get('ip_quality', {}).get('timezone_match')
+    lang_ok = results.get('ip_quality', {}).get('lang_match')
     ip_clean = not (results.get('ip_quality', {}).get('hosting') or
                     results.get('ip_quality', {}).get('proxy'))
+    cf_consistent = results.get('cf_trace', {}).get('ip_consistent')
+    cf_unknown = results.get('cf_trace', {}).get('status') in ('unknown', 'error')
     waf_ok = results.get('cloudflare_waf', {}).get('status') == 'pass'
-    waf_unknown = results.get('cloudflare_waf', {}).get('status') in ('unknown', 'error')
+    waf_unknown = results.get('cloudflare_waf', {}).get('status') in ('unknown', 'error', 'skipped')
     api_ok = results.get('api_connectivity', {}).get('status') == 'reachable'
-    api_unknown = results.get('api_connectivity', {}).get('status') in ('unknown', 'error')
+    api_unknown = results.get('api_connectivity', {}).get('status') in ('unknown', 'error', 'skipped')
 
     c = level_colors.get(level, '')
-    print(f"\n{Colors.BOLD}====================== 综合风险评估 ================================{Colors.RESET}")
-    print(f"  IPv6 泄漏    : {_status_icon(ipv6_ok)}")
-    print(f"  DNS 泄漏     : {_status_icon(dns_ok if not dns_unknown else None)}")
-    print(f"  时区匹配     : {_status_icon(tz_ok)}")
-    print(f"  IP 质量      : {_status_icon(ip_clean if results.get('ip_quality', {}).get('status') == 'ok' else None)}")
-    print(f"  Web WAF      : {_status_icon(waf_ok if not waf_unknown else None)}")
-    print(f"  API 连通     : {_status_icon(api_ok if not api_unknown else None)}")
+    score_color, score_text = _score_label(score)
+
+    print(f"\n{Colors.BOLD}{'=' * 68}")
+    print(f"                        综合风险评估")
+    print(f"{'=' * 68}{Colors.RESET}")
+
+    # 信任评分（大字显示）
+    print(f"\n  {Colors.BOLD}信任评分{Colors.RESET}  {score_color}{Colors.BOLD}{score}/100{Colors.RESET}"
+          f"  {score_color}{score_text}{Colors.RESET}")
+    print(f"  {_score_bar(score)}\n")
+
+    # 检测项明细
+    print(f"  {'检测项':<14s}{'结果':s}")
+    print(f"  {'─' * 40}")
+    print(f"  {'IPv6 泄漏':<12s}: {_status_icon(ipv6_ok)}")
+    print(f"  {'DNS 泄漏':<12s}: {_status_icon(dns_ok if not dns_unknown else None)}")
+    print(f"  {'时区匹配':<12s}: {_status_icon(tz_ok)}")
+    print(f"  {'语言匹配':<12s}: {_status_icon(lang_ok)}")
+    print(f"  {'IP 质量':<12s}: {_status_icon(ip_clean if results.get('ip_quality', {}).get('status') == 'ok' else None)}")
+    print(f"  {'IP 一致性':<11s}: {_status_icon(cf_consistent if not cf_unknown else None)}")
+    print(f"  {'Web WAF':<13s}: {_status_icon(waf_ok if not waf_unknown else None)}")
+    print(f"  {'API 连通':<12s}: {_status_icon(api_ok if not api_unknown else None)}")
+
     print(f"\n  🔒 综合风险等级: {c}{Colors.BOLD}{level_labels.get(level, level)}{Colors.RESET}")
 
     if suggestions:
-        print(f"  📋 建议: {'; '.join(suggestions)}")
+        print(f"\n  📋 改进建议:")
+        for i, s in enumerate(suggestions, 1):
+            print(f"     {i}. {s}")
 
-    print(f"{Colors.BOLD}====================================================================={Colors.RESET}\n")
+    print(f"\n{Colors.BOLD}{'=' * 68}{Colors.RESET}\n")
 
 # ─── 入口 ────────────────────────────────────────────────────────────────
 
@@ -476,25 +818,31 @@ def main():
 
     check_local_env(results)
     check_ip_attributes(results)
+    check_cloudflare_trace(results)
 
     if not args.skip_web:
         check_claude_web(results)
     else:
         results['cloudflare_waf'] = {'status': 'skipped'}
         if not args.json_output:
-            print(f"\n{Colors.BOLD}[*] 3. Web WAF 检测 — 已跳过 (--skip-web){Colors.RESET}")
+            print(f"\n{Colors.BOLD}[*] 4. Web WAF 检测 — 已跳过 (--skip-web){Colors.RESET}")
 
     if not args.skip_api:
         check_claude_api(results)
     else:
         results['api_connectivity'] = {'status': 'skipped'}
         if not args.json_output:
-            print(f"\n{Colors.BOLD}[*] 4. API 连通性检测 — 已跳过 (--skip-api){Colors.RESET}")
+            print(f"\n{Colors.BOLD}[*] 5. API 连通性检测 — 已跳过 (--skip-api){Colors.RESET}")
+
+    check_latency_and_status(results)
 
     if args.json_output:
         level, suggestions = calculate_risk(results)
+        score, score_details = calculate_trust_score(results)
         results['overall_risk'] = level
         results['suggestions'] = suggestions
+        results['trust_score'] = score
+        results['trust_score_details'] = score_details
         print(json.dumps(results, ensure_ascii=False, indent=2))
     else:
         print_summary(results)
